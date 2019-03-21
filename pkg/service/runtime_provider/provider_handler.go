@@ -724,7 +724,7 @@ func (p *ProviderHandler) waitInstanceNetwork(ctx context.Context, instanceServi
 		}
 
 		instance.PrivateIp = ins.VpcAttributes.PrivateIpAddress.IpAddress[0]
-		instance.Eip = ins.EipAddress.IpAddress
+		instance.Eip = ins.PublicIpAddress.IpAddress[0]
 		return true, nil
 	}, timeout, waitInterval)
 
