@@ -4,7 +4,10 @@
 
 package runtime_provider
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 const (
 	G = 1024
@@ -17,6 +20,7 @@ type CpuAndMemory struct {
 
 var (
 	InstanceTypeMap = map[CpuAndMemory]string{
+		{1, 512}:   "ecs.t5-lc2m1.nano",
 		{1, 1 * G}: "ecs.t5-lc1m1.small",
 		{1, 2 * G}: "ecs.t5-lc1m2.small",
 
@@ -54,7 +58,7 @@ var (
 func ConvertToInstanceType(cpu, memory int) (string, error) {
 	instanceType, ok := InstanceTypeMap[CpuAndMemory{cpu, memory}]
 	if !ok {
-		return "", fmt.Errorf("no aws instance type matched with cpu [%d] memory [%d]", cpu, memory)
+		return "", fmt.Errorf("no aliyun instance type matched with cpu [%d] memory [%d]", cpu, memory)
 	}
 
 	return instanceType, nil
@@ -63,8 +67,16 @@ func ConvertToInstanceType(cpu, memory int) (string, error) {
 func ConvertToVolumeType(volumeClass int) (string, error) {
 	volumeType, ok := volumeTypeMap[volumeClass]
 	if !ok {
-		return "", fmt.Errorf("no aws volume type matched with volume class [%d]", volumeClass)
+		return "", fmt.Errorf("no aliyun volume type matched with volume class [%d]", volumeClass)
 	}
 
 	return volumeType, nil
+}
+
+func ConvertZoneToRegion(zone string) string {
+	sp := strings.Split(zone, "-")
+	if len(sp) == 1 {
+		return zone
+	}
+	return strings.Join(sp[:len(sp)-1], "-")
 }
