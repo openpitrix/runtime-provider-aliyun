@@ -23,9 +23,9 @@ import (
 	"openpitrix.io/openpitrix/pkg/util/funcutil"
 	"openpitrix.io/openpitrix/pkg/util/jsonutil"
 	"openpitrix.io/openpitrix/pkg/util/pbutil"
+	"openpitrix.io/openpitrix/pkg/util/retryutil"
 )
 
-var MyProvider = constants.ProviderAliyun
 var DevicePattern = regexp.MustCompile("/dev/xvd(.)")
 
 type ProviderHandler struct {
@@ -45,7 +45,7 @@ func (p *ProviderHandler) initInstanceServiceWithCredential(ctx context.Context,
 	credential := new(vmbased.Credential)
 	err := jsonutil.Decode([]byte(runtimeCredential), credential)
 	if err != nil {
-		logger.Error(ctx, "Parse [%s] credential failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Parse credential failed: %+v", err)
 		return nil, err
 	}
 
@@ -55,6 +55,39 @@ func (p *ProviderHandler) initInstanceServiceWithCredential(ctx context.Context,
 	}
 
 	return ecsClient, nil
+}
+
+func (p *ProviderHandler) getSubnet(ctx context.Context, service *ecs.Client, zone, subnetId string) (*ecs.VSwitch, error) {
+	describeVSwitchsRequest := ecs.CreateDescribeVSwitchesRequest()
+	describeVSwitchsRequest.ZoneId = zone
+	describeVSwitchsRequest.VSwitchId = subnetId
+	describeVSwitchsResponse, err := service.DescribeVSwitches(describeVSwitchsRequest)
+	if err != nil {
+		logger.Error(ctx, "DescribeVSwitches [%s] failed: %+v", subnetId, err)
+		return nil, err
+	}
+
+	if len(describeVSwitchsResponse.VSwitches.VSwitch) == 0 {
+		logger.Error(ctx, "DescribeVSwitches failed with 0 output subnets")
+		return nil, fmt.Errorf("DescribeVSwitches failed with 0 output subnets")
+	}
+	return &describeVSwitchsResponse.VSwitches.VSwitch[0], nil
+}
+
+func (p *ProviderHandler) getSecurityGroup(ctx context.Context, service *ecs.Client, zone, vpcId string) (*ecs.SecurityGroup, error) {
+	describeSecurityGroupsRequest := ecs.CreateDescribeSecurityGroupsRequest()
+	describeSecurityGroupsRequest.VpcId = vpcId
+	describeSecurityGroupsRequest.RegionId = ConvertZoneToRegion(zone)
+	describeSecurityGroups, err := service.DescribeSecurityGroups(describeSecurityGroupsRequest)
+	if err != nil {
+		logger.Error(ctx, "DescribeSecurityGroups vpc [%s] failed: %+v", vpcId, err)
+		return nil, err
+	}
+	if len(describeSecurityGroups.SecurityGroups.SecurityGroup) == 0 {
+		logger.Error(ctx, "DescribeSecurityGroups failed with 0 output security group")
+		return nil, fmt.Errorf("DescribeSecurityGroups failed with 0 output security group")
+	}
+	return &describeSecurityGroups.SecurityGroups.SecurityGroup[0], nil
 }
 
 func (p *ProviderHandler) RunInstances(ctx context.Context, task *models.Task) (*models.Task, error) {
@@ -68,7 +101,7 @@ func (p *ProviderHandler) RunInstances(ctx context.Context, task *models.Task) (
 	}
 	instanceService, err := p.initInstanceService(ctx, instance.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -80,27 +113,47 @@ func (p *ProviderHandler) RunInstances(ctx context.Context, task *models.Task) (
 
 	logger.Info(ctx, "RunInstances with name [%s] instance type [%s]", instance.Name, instanceType)
 
-	input := ecs.CreateCreateInstanceRequest()
+	input := ecs.CreateRunInstancesRequest()
 	input.InstanceName = instance.Name
 	input.ImageId = instance.ImageId
 	input.InstanceType = instanceType
 	input.VSwitchId = instance.Subnet
 	input.ZoneId = instance.Zone
 	input.Password = DefaultLoginPassword
+	input.InternetMaxBandwidthIn = requests.NewInteger(1)
+	input.InternetChargeType = "PayByTraffic"
+	input.InternetMaxBandwidthOut = requests.NewInteger(1)
+	input.SystemDiskSize = "20"
+	input.SystemDiskCategory, _ = ConvertToVolumeType(DefaultVolumeClass)
 
 	if instance.NeedUserData == 1 {
 		input.UserData = instance.UserDataValue
 	}
 
-	logger.Debug(ctx, "RunInstances with input: %s", jsonutil.ToString(input))
-	output, err := instanceService.CreateInstance(input)
+	subnet, err := p.getSubnet(ctx, instanceService, instance.Zone, instance.Subnet)
 	if err != nil {
-		logger.Error(ctx, "Send RunInstances to %s failed: %+v", MyProvider, err)
+		return nil, err
+	}
+	securityGroup, err := p.getSecurityGroup(ctx, instanceService, instance.Zone, subnet.VpcId)
+	if err != nil {
+		return nil, err
+	}
+	input.SecurityGroupId = securityGroup.SecurityGroupId
+
+	logger.Debug(ctx, "RunInstances with input: %s", jsonutil.ToString(input))
+	output, err := instanceService.RunInstances(input)
+	if err != nil {
+		logger.Error(ctx, "RunInstances failed: %+v", err)
 		return task, err
 	}
 	logger.Debug(ctx, "RunInstances get output: %s", jsonutil.ToString(output))
 
-	instance.InstanceId = output.InstanceId
+	if len(output.InstanceIdSets.InstanceIdSet) == 0 {
+		logger.Error(ctx, "RunInstances response with 0 output")
+		return task, fmt.Errorf("failed to get instance id")
+	}
+
+	instance.InstanceId = output.InstanceIdSets.InstanceIdSet[0]
 
 	// write back
 	task.Directive = jsonutil.ToString(instance)
@@ -123,7 +176,7 @@ func (p *ProviderHandler) StopInstances(ctx context.Context, task *models.Task) 
 	}
 	instanceService, err := p.initInstanceService(ctx, instance.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -131,12 +184,12 @@ func (p *ProviderHandler) StopInstances(ctx context.Context, task *models.Task) 
 	describeInput.InstanceIds = fmt.Sprintf("[\"%s\"]", instance.InstanceId)
 	describeOutput, err := instanceService.DescribeInstances(describeInput)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeInstances to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeInstances failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput.Instances.Instance) == 0 {
-		return task, fmt.Errorf("instance with id [%s] not exist", instance.InstanceId)
+		return task, fmt.Errorf("instance [%s] not exist", instance.InstanceId)
 	}
 
 	status := describeOutput.Instances.Instance[0].Status
@@ -153,7 +206,7 @@ func (p *ProviderHandler) StopInstances(ctx context.Context, task *models.Task) 
 
 	_, err = instanceService.StopInstance(input)
 	if err != nil {
-		logger.Error(ctx, "Send StopInstances to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "StopInstances failed: %+v", err)
 		return task, err
 	}
 
@@ -178,7 +231,7 @@ func (p *ProviderHandler) StartInstances(ctx context.Context, task *models.Task)
 	}
 	instanceService, err := p.initInstanceService(ctx, instance.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -186,12 +239,12 @@ func (p *ProviderHandler) StartInstances(ctx context.Context, task *models.Task)
 	describeInput.InstanceIds = fmt.Sprintf("[\"%s\"]", instance.InstanceId)
 	describeOutput, err := instanceService.DescribeInstances(describeInput)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeInstances to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeInstances failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput.Instances.Instance) == 0 {
-		return task, fmt.Errorf("instance with id [%s] not exist", instance.InstanceId)
+		return task, fmt.Errorf("instance [%s] not exist", instance.InstanceId)
 	}
 
 	status := describeOutput.Instances.Instance[0].Status
@@ -208,7 +261,7 @@ func (p *ProviderHandler) StartInstances(ctx context.Context, task *models.Task)
 
 	_, err = instanceService.StartInstance(input)
 	if err != nil {
-		logger.Error(ctx, "Send StartInstances to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "StartInstances failed: %+v", err)
 		return task, err
 	}
 
@@ -233,7 +286,7 @@ func (p *ProviderHandler) DeleteInstances(ctx context.Context, task *models.Task
 	}
 	instanceService, err := p.initInstanceService(ctx, instance.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -241,12 +294,12 @@ func (p *ProviderHandler) DeleteInstances(ctx context.Context, task *models.Task
 	describeInput.InstanceIds = fmt.Sprintf("[\"%s\"]", instance.InstanceId)
 	describeOutput, err := instanceService.DescribeInstances(describeInput)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeInstances to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeInstances failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput.Instances.Instance) == 0 {
-		return task, fmt.Errorf("instance with id [%s] not exist", instance.InstanceId)
+		return task, fmt.Errorf("instance [%s] not exist", instance.InstanceId)
 	}
 
 	status := describeOutput.Instances.Instance[0].Status
@@ -254,7 +307,7 @@ func (p *ProviderHandler) DeleteInstances(ctx context.Context, task *models.Task
 		logger.Info(ctx, "StopInstance [%s] before delete it", instance.Name)
 		task, err := p.StopInstances(ctx, task)
 		if err != nil {
-			logger.Error(ctx, "Send StopInstances to %s failed: %+v", MyProvider, err)
+			logger.Error(ctx, "StopInstances failed: %+v", err)
 			return task, err
 		}
 
@@ -271,7 +324,7 @@ func (p *ProviderHandler) DeleteInstances(ctx context.Context, task *models.Task
 
 	_, err = instanceService.DeleteInstance(input)
 	if err != nil {
-		logger.Error(ctx, "Send DeleteInstance to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DeleteInstance failed: %+v", err)
 		return task, err
 	}
 
@@ -296,7 +349,7 @@ func (p *ProviderHandler) ResizeInstances(ctx context.Context, task *models.Task
 	}
 	instanceService, err := p.initInstanceService(ctx, instance.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -304,12 +357,12 @@ func (p *ProviderHandler) ResizeInstances(ctx context.Context, task *models.Task
 	describeInput.InstanceIds = fmt.Sprintf("[\"%s\"]", instance.InstanceId)
 	describeOutput, err := instanceService.DescribeInstances(describeInput)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeInstances to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeInstances failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput.Instances.Instance) == 0 {
-		return task, fmt.Errorf("instance with id [%s] not exist", instance.InstanceId)
+		return task, fmt.Errorf("instance [%s] not exist", instance.InstanceId)
 	}
 
 	status := describeOutput.Instances.Instance[0].Status
@@ -333,7 +386,7 @@ func (p *ProviderHandler) ResizeInstances(ctx context.Context, task *models.Task
 
 	_, err = instanceService.ModifyInstanceSpec(input)
 	if err != nil {
-		logger.Error(ctx, "Send ResizeInstances to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "ResizeInstances failed: %+v", err)
 		return task, err
 	}
 
@@ -353,7 +406,7 @@ func (p *ProviderHandler) CreateVolumes(ctx context.Context, task *models.Task) 
 	}
 	instanceService, err := p.initInstanceService(ctx, volume.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -372,7 +425,7 @@ func (p *ProviderHandler) CreateVolumes(ctx context.Context, task *models.Task) 
 
 	output, err := instanceService.CreateDisk(input)
 	if err != nil {
-		logger.Error(ctx, "Send CreateVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "CreateVolumes failed: %+v", err)
 		return task, err
 	}
 
@@ -403,7 +456,7 @@ func (p *ProviderHandler) DetachVolumes(ctx context.Context, task *models.Task) 
 	}
 	instanceService, err := p.initInstanceService(ctx, volume.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -411,12 +464,12 @@ func (p *ProviderHandler) DetachVolumes(ctx context.Context, task *models.Task) 
 	describeInput.DiskIds = fmt.Sprintf("[\"%s\"]", volume.VolumeId)
 	describeOutput, err := instanceService.DescribeDisks(describeInput)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeVolumes failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput.Disks.Disk) == 0 {
-		return task, fmt.Errorf("volume with id [%s] not exist", volume.VolumeId)
+		return task, fmt.Errorf("volume [%s] not exist", volume.VolumeId)
 	}
 
 	status := describeOutput.Disks.Disk[0].Status
@@ -426,7 +479,7 @@ func (p *ProviderHandler) DetachVolumes(ctx context.Context, task *models.Task) 
 		return task, nil
 	}
 
-	logger.Info(ctx, "DetachVolume [%s] from instance with id [%s]", volume.Name, volume.InstanceId)
+	logger.Info(ctx, "DetachVolume [%s] from instance [%s]", volume.Name, volume.InstanceId)
 
 	input := ecs.CreateDetachDiskRequest()
 	input.InstanceId = volume.InstanceId
@@ -434,7 +487,7 @@ func (p *ProviderHandler) DetachVolumes(ctx context.Context, task *models.Task) 
 
 	_, err = instanceService.DetachDisk(input)
 	if err != nil {
-		logger.Error(ctx, "Send DetachVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DetachVolumes failed: %+v", err)
 		return task, err
 	}
 
@@ -463,19 +516,23 @@ func (p *ProviderHandler) AttachVolumes(ctx context.Context, task *models.Task) 
 	}
 	instanceService, err := p.initInstanceService(ctx, volume.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
-	logger.Info(ctx, "AttachVolume [%s] to instance with id [%s]", volume.Name, volume.InstanceId)
+	logger.Info(ctx, "AttachVolume [%s] to instance [%s]", volume.VolumeId, volume.InstanceId)
 
 	input := ecs.CreateAttachDiskRequest()
 	input.InstanceId = volume.InstanceId
 	input.DiskId = volume.VolumeId
 
-	_, err = instanceService.AttachDisk(input)
+	err = retryutil.Retry(5, 3*time.Second, func() error {
+		// Already check instance status, but may failed here because of IncorrectInstanceStatus
+		_, err = instanceService.AttachDisk(input)
+		return err
+	})
 	if err != nil {
-		logger.Error(ctx, "Send AttachVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "AttachVolumes failed: %+v", err)
 		return task, err
 	}
 
@@ -500,7 +557,7 @@ func (p *ProviderHandler) DeleteVolumes(ctx context.Context, task *models.Task) 
 	}
 	instanceService, err := p.initInstanceService(ctx, volume.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -508,12 +565,12 @@ func (p *ProviderHandler) DeleteVolumes(ctx context.Context, task *models.Task) 
 	describeInput.DiskIds = fmt.Sprintf("[\"%s\"]", volume.VolumeId)
 	describeOutput, err := instanceService.DescribeDisks(describeInput)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeVolumes failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput.Disks.Disk) == 0 {
-		return task, fmt.Errorf("volume with id [%s] not exist", volume.VolumeId)
+		return task, fmt.Errorf("volume [%s] not exist", volume.VolumeId)
 	}
 
 	disk := describeOutput.Disks.Disk[0]
@@ -531,7 +588,7 @@ func (p *ProviderHandler) DeleteVolumes(ctx context.Context, task *models.Task) 
 
 	_, err = instanceService.DeleteDisk(input)
 	if err != nil {
-		logger.Error(ctx, "Send DeleteVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DeleteVolumes failed: %+v", err)
 		return task, err
 	}
 
@@ -556,7 +613,7 @@ func (p *ProviderHandler) ResizeVolumes(ctx context.Context, task *models.Task) 
 	}
 	instanceService, err := p.initInstanceService(ctx, volume.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -564,12 +621,12 @@ func (p *ProviderHandler) ResizeVolumes(ctx context.Context, task *models.Task) 
 	describeInput.DiskIds = fmt.Sprintf("[\"%s\"]", volume.VolumeId)
 	describeOutput, err := instanceService.DescribeDisks(describeInput)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeVolumes failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput.Disks.Disk) == 0 {
-		return task, fmt.Errorf("volume with id [%s] not exist", volume.VolumeId)
+		return task, fmt.Errorf("volume [%s] not exist", volume.VolumeId)
 	}
 
 	status := describeOutput.Disks.Disk[0].Status
@@ -586,7 +643,7 @@ func (p *ProviderHandler) ResizeVolumes(ctx context.Context, task *models.Task) 
 
 	_, err = instanceService.ResizeDisk(input)
 	if err != nil {
-		logger.Error(ctx, "Send ResizeVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "ResizeVolumes failed: %+v", err)
 		return task, err
 	}
 
@@ -614,12 +671,12 @@ func (p *ProviderHandler) waitInstanceVolume(ctx context.Context, instanceServic
 	describeInput.DiskIds = fmt.Sprintf("[\"%s\"]", instance.VolumeId)
 	describeOutput, err := instanceService.DescribeDisks(describeInput)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeVolumes to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeVolumes failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput.Disks.Disk) == 0 {
-		return task, fmt.Errorf("volume with id [%s] not exist", instance.VolumeId)
+		return task, fmt.Errorf("volume [%s] not exist", instance.VolumeId)
 	}
 
 	vol := describeOutput.Disks.Disk[0]
@@ -629,12 +686,12 @@ func (p *ProviderHandler) waitInstanceVolume(ctx context.Context, instanceServic
 	describeInput2.InstanceIds = fmt.Sprintf("[\"%s\"]", instance.InstanceId)
 	describeOutput2, err := instanceService.DescribeInstances(describeInput2)
 	if err != nil {
-		logger.Error(ctx, "Send DescribeInstances to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeInstances failed: %+v", err)
 		return task, err
 	}
 
 	if len(describeOutput2.Instances.Instance) == 0 {
-		return task, fmt.Errorf("instance with id [%s] not exist", instance.InstanceId)
+		return task, fmt.Errorf("instance [%s] not exist", instance.InstanceId)
 	}
 
 	ins := describeOutput2.Instances.Instance[0]
@@ -657,7 +714,7 @@ func (p *ProviderHandler) waitInstanceNetwork(ctx context.Context, instanceServi
 		}
 
 		if len(describeOutput.Instances.Instance) == 0 {
-			return false, fmt.Errorf("instance with id [%s] not exist", instance.InstanceId)
+			return false, fmt.Errorf("instance [%s] not exist", instance.InstanceId)
 		}
 
 		ins := describeOutput.Instances.Instance[0]
@@ -695,13 +752,12 @@ func (p *ProviderHandler) WaitRunInstances(ctx context.Context, task *models.Tas
 	}
 	instanceService, err := p.initInstanceService(ctx, instance.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
-	task, err = p.WaitInstanceState(ctx, task, strings.Title(constants.StatusStopped))
+	task, err = p.WaitInstanceState(ctx, task, strings.Title(constants.StatusRunning))
 	if err != nil {
-		logger.Error(ctx, "Wait %s job [%s] failed: %+v", MyProvider, instance.TargetJobId, err)
 		return task, err
 	}
 
@@ -715,19 +771,7 @@ func (p *ProviderHandler) WaitRunInstances(ctx context.Context, task *models.Tas
 
 	err = p.waitInstanceNetwork(ctx, instanceService, instance, task.GetTimeout(constants.WaitTaskTimeout), constants.WaitTaskInterval)
 	if err != nil {
-		logger.Error(ctx, "Wait %s instance [%s] network failed: %+v", MyProvider, instance.InstanceId, err)
-		return task, err
-	}
-
-	task, err = p.StartInstances(ctx, task)
-	if err != nil {
-		logger.Error(ctx, "Start %s instance [%s] failed: %+v", MyProvider, instance.InstanceId, err)
-		return task, err
-	}
-
-	task, err = p.WaitInstanceState(ctx, task, strings.Title(constants.StatusRunning))
-	if err != nil {
-		logger.Error(ctx, "Wait %s job [%s] failed: %+v", MyProvider, instance.TargetJobId, err)
+		logger.Error(ctx, "Wait instance [%s] network failed: %+v", instance.InstanceId, err)
 		return task, err
 	}
 
@@ -754,7 +798,7 @@ func (p *ProviderHandler) WaitInstanceState(ctx context.Context, task *models.Ta
 	}
 	instanceService, err := p.initInstanceService(ctx, instance.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -766,8 +810,10 @@ func (p *ProviderHandler) WaitInstanceState(ctx context.Context, task *models.Ta
 			return true, err
 		}
 
+		// may happen, so can not return err here
 		if len(output.Instances.Instance) == 0 {
-			return true, fmt.Errorf("instance with id [%s] not exist", instance.InstanceId)
+			logger.Error(ctx, "Instance [%s] not exist", instance.InstanceId)
+			return false, nil
 		}
 
 		if output.Instances.Instance[0].Status == state {
@@ -777,11 +823,11 @@ func (p *ProviderHandler) WaitInstanceState(ctx context.Context, task *models.Ta
 		return false, nil
 	}, task.GetTimeout(constants.WaitTaskTimeout), constants.WaitTaskInterval)
 	if err != nil {
-		logger.Error(ctx, "Wait %s instance [%s] status become to [%s] failed: %+v", MyProvider, instance.InstanceId, state, err)
+		logger.Error(ctx, "Wait instance [%s] status become to [%s] failed: %+v", instance.InstanceId, state, err)
 		return task, err
 	}
 
-	logger.Info(ctx, "Wait %s instance [%s] status become to [%s] success", MyProvider, instance.InstanceId, state)
+	logger.Info(ctx, "Wait instance [%s] status become to [%s] success", instance.InstanceId, state)
 
 	return task, nil
 }
@@ -801,7 +847,7 @@ func (p *ProviderHandler) WaitVolumeState(ctx context.Context, task *models.Task
 	}
 	instanceService, err := p.initInstanceService(ctx, volume.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -825,11 +871,11 @@ func (p *ProviderHandler) WaitVolumeState(ctx context.Context, task *models.Task
 		return false, nil
 	}, task.GetTimeout(constants.WaitTaskTimeout), constants.WaitTaskInterval)
 	if err != nil {
-		logger.Error(ctx, "Wait %s volume [%s] status become to [%s] failed: %+v", MyProvider, volume.VolumeId, state, err)
+		logger.Error(ctx, "Wait volume [%s] status become to [%s] failed: %+v", volume.VolumeId, state, err)
 		return task, err
 	}
 
-	logger.Info(ctx, "Wait %s volume [%s] status become to [%s] success", MyProvider, volume.VolumeId, state)
+	logger.Info(ctx, "Wait volume [%s] status become to [%s] success", volume.VolumeId, state)
 
 	return task, nil
 }
@@ -857,7 +903,7 @@ func (p *ProviderHandler) WaitDeleteInstances(ctx context.Context, task *models.
 	}
 	instanceService, err := p.initInstanceService(ctx, instance.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -870,7 +916,7 @@ func (p *ProviderHandler) WaitDeleteInstances(ctx context.Context, task *models.
 		}
 
 		if len(output.Instances.Instance) == 0 {
-			logger.Info(ctx, "Wait %s instance [%s] to be deleted successfully", MyProvider, instance.InstanceId)
+			logger.Info(ctx, "Wait instance [%s] to be deleted successfully", instance.InstanceId)
 			return true, nil
 		}
 
@@ -910,7 +956,7 @@ func (p *ProviderHandler) WaitDeleteVolumes(ctx context.Context, task *models.Ta
 	}
 	instanceService, err := p.initInstanceService(ctx, volume.RuntimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return task, err
 	}
 
@@ -923,7 +969,7 @@ func (p *ProviderHandler) WaitDeleteVolumes(ctx context.Context, task *models.Ta
 		}
 
 		if len(output.Disks.Disk) == 0 {
-			logger.Info(ctx, "Wait %s volume [%s] to be deleted successfully", MyProvider, volume.VolumeId)
+			logger.Info(ctx, "Wait volume [%s] to be deleted successfully", volume.VolumeId)
 			return true, nil
 		}
 
@@ -939,7 +985,7 @@ func (p *ProviderHandler) WaitResizeVolumes(ctx context.Context, task *models.Ta
 func (p *ProviderHandler) DescribeSubnets(ctx context.Context, req *pb.DescribeSubnetsRequest) (*pb.DescribeSubnetsResponse, error) {
 	instanceService, err := p.initInstanceService(ctx, req.GetRuntimeId().GetValue())
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return nil, err
 	}
 
@@ -955,13 +1001,13 @@ func (p *ProviderHandler) DescribeSubnets(ctx context.Context, req *pb.DescribeS
 
 	output, err := instanceService.DescribeVSwitches(input)
 	if err != nil {
-		logger.Error(ctx, "DescribeVSwitches to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeVSwitches failed: %+v", err)
 		return nil, err
 	}
 
 	if len(output.VSwitches.VSwitch) == 0 {
-		logger.Error(ctx, "Send DescribeVSwitches to %s failed with 0 output subnets", MyProvider)
-		return nil, fmt.Errorf("send DescribeVSwitches to %s failed with 0 output subnets", MyProvider)
+		logger.Error(ctx, "DescribeVSwitches failed with 0 output subnets")
+		return nil, fmt.Errorf("DescribeVSwitches failed with 0 output subnets")
 	}
 
 	response := new(pb.DescribeSubnetsResponse)
@@ -999,7 +1045,7 @@ func (p *ProviderHandler) CheckResourceQuotas(ctx context.Context, clusterWrappe
 func (p *ProviderHandler) DescribeVpc(ctx context.Context, runtimeId, vpcId string) (*models.Vpc, error) {
 	instanceService, err := p.initInstanceService(ctx, runtimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return nil, err
 	}
 
@@ -1008,13 +1054,13 @@ func (p *ProviderHandler) DescribeVpc(ctx context.Context, runtimeId, vpcId stri
 
 	output, err := instanceService.DescribeVpcs(input)
 	if err != nil {
-		logger.Error(ctx, "DescribeVpcs to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeVpcs to failed: %+v", err)
 		return nil, err
 	}
 
 	if len(output.Vpcs.Vpc) == 0 {
-		logger.Error(ctx, "Send DescribeVpcs to %s failed with 0 output instances", MyProvider)
-		return nil, fmt.Errorf("send DescribeVpcs to %s failed with 0 output instances", MyProvider)
+		logger.Error(ctx, "DescribeVpcs failed with 0 output instances")
+		return nil, fmt.Errorf("DescribeVpcs failed with 0 output instances")
 	}
 
 	vpc := output.Vpcs.Vpc[0]
@@ -1031,14 +1077,14 @@ func (p *ProviderHandler) DescribeZones(ctx context.Context, url, credential str
 	zone := DefaultZone
 	instanceService, err := p.initInstanceServiceWithCredential(ctx, url, credential, zone)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return nil, err
 	}
 
 	input := ecs.CreateDescribeRegionsRequest()
 	output, err := instanceService.DescribeRegions(input)
 	if err != nil {
-		logger.Error(ctx, "DescribeRegions to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeRegions failed: %+v", err)
 		return nil, err
 	}
 
@@ -1052,14 +1098,14 @@ func (p *ProviderHandler) DescribeZones(ctx context.Context, url, credential str
 func (p *ProviderHandler) DescribeKeyPairs(ctx context.Context, url, credential, zone string) ([]string, error) {
 	instanceService, err := p.initInstanceServiceWithCredential(ctx, url, credential, zone)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return nil, err
 	}
 
 	input := ecs.CreateDescribeKeyPairsRequest()
 	output, err := instanceService.DescribeKeyPairs(input)
 	if err != nil {
-		logger.Error(ctx, "DescribeKeyPairs to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeKeyPairs failed: %+v", err)
 		return nil, err
 	}
 
@@ -1073,7 +1119,7 @@ func (p *ProviderHandler) DescribeKeyPairs(ctx context.Context, url, credential,
 func (p *ProviderHandler) DescribeImage(ctx context.Context, runtimeId, imageName string) (string, error) {
 	instanceService, err := p.initInstanceService(ctx, runtimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return "", err
 	}
 
@@ -1082,7 +1128,7 @@ func (p *ProviderHandler) DescribeImage(ctx context.Context, runtimeId, imageNam
 
 	output, err := instanceService.DescribeImages(input)
 	if err != nil {
-		logger.Error(ctx, "DescribeImages to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeImages failed: %+v", err)
 		return "", err
 	}
 
@@ -1098,7 +1144,7 @@ func (p *ProviderHandler) DescribeImage(ctx context.Context, runtimeId, imageNam
 func (p *ProviderHandler) DescribeAvailabilityZoneBySubnetId(ctx context.Context, runtimeId, subnetId string) (string, error) {
 	instanceService, err := p.initInstanceService(ctx, runtimeId)
 	if err != nil {
-		logger.Error(ctx, "Init %s api service failed: %+v", MyProvider, err)
+		logger.Error(ctx, "Init api service failed: %+v", err)
 		return "", err
 	}
 
@@ -1106,12 +1152,12 @@ func (p *ProviderHandler) DescribeAvailabilityZoneBySubnetId(ctx context.Context
 	input.VSwitchId = subnetId
 	output, err := instanceService.DescribeVSwitches(input)
 	if err != nil {
-		logger.Error(ctx, "DescribeSubnets to %s failed: %+v", MyProvider, err)
+		logger.Error(ctx, "DescribeVSwitches failed: %+v", err)
 		return "", err
 	}
 
 	if len(output.VSwitches.VSwitch) == 0 {
-		return "", fmt.Errorf("subnet with id [%s] not exist", subnetId)
+		return "", fmt.Errorf("subnet [%s] not exist", subnetId)
 	}
 
 	zone := output.VSwitches.VSwitch[0].ZoneId
